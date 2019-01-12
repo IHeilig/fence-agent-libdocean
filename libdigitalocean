@@ -1,0 +1,380 @@
+#!/bin/sh
+#
+# External STONITH module for digital ocean VMs.
+# Uses libdocean as a STONITH device to control guest.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+
+export TOKEN=<a token>
+
+hypervisor_uri="https://api.digitalocean.com/v2"
+
+# usage
+usage()
+{
+cat <<EOF
+Usage: libdocean -o|--action -n|--port
+Options:
+ -h, --help 		This text
+ -V, --version		Version information
+
+Commands:
+ -o, --action		Action to perform: on|off|reboot|status|monitor
+ -n, --port 		The id of a droplet/instance to control/check
+
+EOF
+    exit 0;
+}
+
+# description
+description="
+libdocean-based host reset for Digital Ocean through API
+
+API actions used by this agent:
+- describe-instances
+- stop-instances
+- start-instances
+- reboot-instances
+"
+
+# metadata
+metadata()
+{
+	cat <<EOF
+<?xml version="1.0" ?>
+<resource-agent name="libdocean" shortdesc="Fencing agent for Digital Ocean instances" >
+	<longdesc>
+	$description
+	</longdesc>
+	<parameters>
+    <parameter name="port" unique="1" required="1">
+		<getopt mixed="-n, --port=[port]" />
+        <content type="string" />
+        <shortdesc lang="en">
+        droplet_id
+        </shortdesc>
+        <longdesc lang="en">
+        Controlled host: droplet_id
+        The droplet_id.
+        </longdesc>
+    </parameter>
+    <parameter name="action" required="0">
+		<getopt mixed="-o, --action=[action]" />
+        <content type="string" default="power_cycle"/>
+        <shortdesc lang="en">
+        How to reset a droplet.
+        </shortdesc>
+        <longdesc lang="en">
+        A droplet reset may be done by a sequence of off and on commands
+        (power_cycle) or by the reboot command. The power_cycle is recommended.
+        </longdesc>
+    </parameter>
+    </parameters>
+    <actions>
+    <action name="on" />
+    <action name="off" />
+	<action name="reboot" />
+    <action name="status" />
+	<action name="list" />
+    <action name="monitor" />
+    <action name="metadata" />
+    </actions>
+</resource-agent>
+EOF
+	exit 0;
+}
+
+# start a droplet
+libdocean_start() {
+    domain_id=$port
+    out=$($CURL -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" -d '{"type":"power_on"}' "$hypervisor_uri/droplets/$domain_id/actions" 2>&1)
+    if [ $? -eq 0 ]
+    then
+        ha_log.sh notice "Instance $domain_id was started"
+        return 0
+    fi
+
+    $CURL -s -X GET -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" "$hypervisor_uri/droplets/$domain_id" 2>&1 |
+        egrep -q 'status\": \"active'
+    if [ $? -eq 0 ]
+    then
+        ha_log.sh notice "Instance $domain_id is already active"
+        return 0
+    fi
+
+    ha_log.sh err "Failed to start $domain_id instance"
+    ha_log.sh err "$out"
+    return 1
+}
+# reboot a droplet
+# return
+#   0: success
+#   1: error
+libdocean_reboot() {
+    local rc out
+    out=$($CURL -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" -d '{"type":"reboot"}' "$hypervisor_uri/droplets/$domain_id/actions" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ]
+    then
+        ha_log.sh notice "Domain $domain_id was rebooted"
+        return 0
+    fi
+    ha_log.sh err "Failed to reboot domain $domain_id (exit code: $rc)"
+    ha_log.sh err "$out"
+    return 1
+}
+
+# stop a droplet
+# return
+#   0: success
+#   1: error
+#   2: was already stopped
+libdocean_stop() {
+    domain_id=$port
+    out=$($CURL -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" -d '{"type":"power_off"}' "$hypervisor_uri/droplets/$domain_id/actions" 2>&1)
+    if [ $? -eq 0 ]
+    then
+        ha_log.sh notice "Instance $domain_id was stopped"
+        return 0
+    fi
+
+    $CURL -s -X GET -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" "$hypervisor_uri/droplets/$domain_id" 2>&1 |
+        egrep -q 'status\": \"off'
+    if [ $? -eq 0 ]
+    then
+        ha_log.sh notice "Instance $domain_id is already stopped"
+        return 2
+    fi
+
+    ha_log.sh err "Failed to stop $domain_id instance"
+    ha_log.sh err "$out"
+    return 1
+}
+
+# get status of stonith device (*NOT* of the VM).
+# If we can retrieve some info from the Digital Ocean
+# the stonith device is OK.
+libdocean_status() {
+    out=$($CURL -s -X GET -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" "$hypervisor_uri/account" 2>&1)
+    if [ $? -eq 0 ]
+    then
+        return 0
+    fi
+
+    ha_log.sh err "Failed to get status for $hypervisor_uri"
+    ha_log.sh err "$out"
+    return 1
+}
+
+# check config and set variables
+# does not return on error
+libdocean_check_config() {
+    CURL=`which curl 2>/dev/null`
+
+    if [ ! -x "$CURL" ]
+    then
+        ha_log.sh err "curl not installed"
+        exit 1
+    fi
+
+    case "$action" in
+    on|off|poweroff|reboot|status|monitor|metadata) : ;;
+    *)
+        ha_log.sh err "unrecognized action: $action"
+        exit 1
+    ;;
+    esac
+}
+
+# set variable domain_id for the host specified as arg
+libdocean_set_domain_id ()
+{
+
+	local domain_id=""
+    domain_id=$port
+
+}
+
+libdocean_info() {
+cat << LDOXML
+<parameters>
+<parameter name="port" unique="1" required="1">
+<content type="string" />
+<shortdesc lang="en">
+domain_id
+</shortdesc>
+<longdesc lang="en">
+Controlled host: domain_id
+The droplet_id.
+</longdesc>
+</parameter>
+
+<parameter name="action" required="0">
+<content type="string" default="poweroff"/>
+<shortdesc lang="en">
+How to reset a droplet.
+</shortdesc>
+<longdesc lang="en">
+A droplet reset may be done by a sequence of off and on commands
+(recommended).
+</longdesc>
+</parameter>
+</parameters>
+LDOXML
+exit 0
+}
+
+#############
+# Main code #
+#############
+TEMP=`getopt -o Vho:e:p:n:c: --long version,help,action:,port:,option: \
+     -n 'libdocean' -- "$@"`
+
+if [ $? != 0 ];then
+    usage
+    exit 1
+fi
+
+# Note the quotes around `$TEMP': they are essential!
+eval set -- "$TEMP"
+
+#  Check for absence of command line args.  If so, the previous call will have set $1 to "--"
+if [ -z "$1" -o "--" = "$1" ]; then
+	# If there are no command line args, look for options from stdin
+	while read line; do
+		case $line in
+			option=*|action=*) action=`echo $line | sed s/.*=//`;;
+			port=*|nodename=*)        port=`echo $line | sed s/.*=//`;;
+			--);;
+			*) ha_log.sh err "Invalid command: $line";;
+		esac
+	done
+fi
+
+while true ; do
+	case "$1" in
+		-o|--action|--option) action=$2;   shift; shift;;
+		-n|--port|--nodename)            port=$2;     shift; shift;;
+		-V|--version) echo "1.0.0"; exit 0;;
+		--help|-h)
+			usage;
+			exit 0;;
+		--) shift ; break ;;
+		*) ha_log.sh err "Unknown option: $1. See --help for details."; exit 1;;
+	esac
+done
+
+[ -n "$1" ] && action=$1
+
+# don't fool yourself when testing with stonith(8)
+# and transport ssh
+unset SSH_AUTH_SOCK
+
+# support , as a separator as well
+port=`echo $port| sed -e 's/,/ /g'`
+
+action=`echo $action | tr 'A-Z' 'a-z'`
+
+case $action in
+    metadata)
+		metadata
+	;;
+    getinfo-xml)
+        libdocean_info
+    ;;
+    getconfignames)
+		for i in port connect
+		do
+			echo $i
+		done
+        exit 0
+    ;;
+    getinfo-devid)
+        echo "libdocean STONITH device"
+        exit 0
+    ;;
+    getinfo-devname)
+        echo "libdocean STONITH external device"
+        exit 0
+    ;;
+    getinfo-devdescr)
+        echo "libdocean fencing agent for Digital Ocean droplets"
+        exit 0
+    ;;
+    getinfo-devurl)
+        echo "https://developers.digitalocean.com/documentation/v2/"
+        exit 0
+    ;;
+esac
+
+case $action in
+    gethosts|list)
+    hostnames=`echo $port|sed -e 's/:[^ ]*//g'`
+    for h in $hostnames
+    do
+        echo $h
+    done
+    exit 0
+    ;;
+
+    poweron|on)
+    libdocean_check_config
+    libdocean_set_domain_id $2
+
+    libdocean_start
+    exit $?
+    ;;
+
+    #reboot)
+    #libdocean_check_config
+    #libdocean_set_domain_id $2
+
+    #libdocean_reboot
+    #exit $?
+    #;;
+
+    poweroff|off|reboot|reset)
+    libdocean_check_config
+    libdocean_set_domain_id $2
+
+    libdocean_stop
+    [ $? = 1 ] && exit 1
+    sleep 45
+    libdocean_start
+    exit $?
+    ;;
+
+    monitor)
+    libdocean_check_config
+    libdocean_status
+    ;;
+
+    status)
+    libdocean_check_config
+    libdocean_status
+    ;;
+	*) ha_log.sh err "Unknown action: $action"; exit 1;;
+esac
+
+status=$?
+
+if [ $status -eq 0 ]; then
+	ha_log.sh info "Operation $action passed"
+else
+	ha_log.sh err "Operation $action failed: $status"
+fi
+
+# vi:et:ts=4:sw=4
